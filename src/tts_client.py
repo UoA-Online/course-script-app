@@ -1,129 +1,245 @@
-\
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
-import time
-import random
 
-from google.cloud import texttospeech
-from google.oauth2 import service_account, credentials as oauth_credentials
-from google.auth.credentials import Credentials
+import base64
+import io
 import json
-from google.api_core.client_options import ClientOptions
+import random
+import re
+import time
+import wave
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
 
-def get_tts_client(
-    *,
-    quota_project_id: Optional[str] = None,
-    api_endpoint: Optional[str] = None,
-    service_account_json: Optional[str] = None,
-    access_token: Optional[str] = None,
-) -> texttospeech.TextToSpeechClient:
-    opts = {}
-    if quota_project_id:
-        opts["quota_project_id"] = quota_project_id
-    if api_endpoint:
-        opts["api_endpoint"] = api_endpoint
+from google.auth.transport.requests import AuthorizedSession
+from google.oauth2 import service_account
 
-    credentials: Optional[Credentials] = None
-    if service_account_json:
-        try:
-            info = json.loads(service_account_json)
-            credentials = service_account.Credentials.from_service_account_info(info)
-        except Exception:
-            credentials = None
-    if access_token:
-        try:
-            credentials = oauth_credentials.Credentials(token=access_token)
-        except Exception:
-            credentials = credentials
+API_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
+SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
+DEFAULT_SAMPLE_RATE_HERTZ = 24000
+DEFAULT_MAX_CHUNK_BYTES = 900
 
-    if opts and credentials:
-        return texttospeech.TextToSpeechClient(client_options=ClientOptions(**opts), credentials=credentials)
-    if opts:
-        return texttospeech.TextToSpeechClient(client_options=ClientOptions(**opts))
-    if credentials:
-        return texttospeech.TextToSpeechClient(credentials=credentials)
-    return texttospeech.TextToSpeechClient()
 
-def list_voices(language_code: str, quota_project_id: str = "") -> List[Dict[str, str]]:
-    # Note: Streamlit cache decorator imported at runtime in app; this function is patched in app.
-    raise RuntimeError("list_voices must be wrapped with st.cache_data in app context")
+@dataclass
+class GeminiTTSClient:
+    session: AuthorizedSession
+    project_id: str
+
 
 @dataclass
 class Throttle:
     min_seconds_between_calls: float = 0.5
     last_call_time: float = 0.0
 
-    def wait(self):
+    def wait(self) -> None:
         now = time.time()
         elapsed = now - self.last_call_time
         if elapsed < self.min_seconds_between_calls:
             time.sleep(self.min_seconds_between_calls - elapsed)
         self.last_call_time = time.time()
 
-def synthesize_mp3(
+
+def load_service_account_info(service_account_value: str) -> dict:
+    raw_value = (service_account_value or "").strip()
+    if not raw_value:
+        raise ValueError("Service account JSON is required.")
+
+    if raw_value.startswith("{"):
+        service_account_info = json.loads(raw_value)
+        if not isinstance(service_account_info, dict):
+            raise ValueError("Service account JSON must decode to an object.")
+        return service_account_info
+
+    json_path = Path(raw_value).expanduser()
+    try:
+        if json_path.is_file():
+            return json.loads(json_path.read_text(encoding="utf-8"))
+    except OSError:
+        pass
+
+    service_account_info = json.loads(raw_value)
+    if not isinstance(service_account_info, dict):
+        raise ValueError("Service account JSON must decode to an object.")
+    return service_account_info
+
+
+def get_tts_client(*, service_account_json: Optional[str] = None) -> GeminiTTSClient:
+    service_account_info = load_service_account_info(service_account_json or "")
+    project_id = service_account_info.get("project_id")
+    if not project_id:
+        raise ValueError("Service account JSON is missing project_id.")
+
+    credentials = service_account.Credentials.from_service_account_info(
+        service_account_info,
+        scopes=SCOPES,
+    )
+    return GeminiTTSClient(
+        session=AuthorizedSession(credentials),
+        project_id=project_id,
+    )
+
+
+def split_text_into_chunks(text: str, max_bytes: int = DEFAULT_MAX_CHUNK_BYTES) -> list[str]:
+    paragraphs = [part.strip() for part in text.splitlines() if part.strip()]
+    if not paragraphs:
+        paragraphs = [text.strip()]
+
+    chunks: list[str] = []
+    current = ""
+
+    for paragraph in paragraphs:
+        sentences = re.split(r"(?<=[.!?])\s+", paragraph)
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+
+            candidate = sentence if not current else f"{current} {sentence}"
+            if len(candidate.encode("utf-8")) <= max_bytes:
+                current = candidate
+                continue
+
+            if current:
+                chunks.append(current)
+                current = ""
+
+            if len(sentence.encode("utf-8")) <= max_bytes:
+                current = sentence
+                continue
+
+            words = sentence.split()
+            oversized = ""
+            for word in words:
+                candidate = word if not oversized else f"{oversized} {word}"
+                if len(candidate.encode("utf-8")) <= max_bytes:
+                    oversized = candidate
+                else:
+                    chunks.append(oversized)
+                    oversized = word
+            if oversized:
+                current = oversized
+
+        if current:
+            chunks.append(current)
+            current = ""
+
+    return chunks
+
+
+def synthesize_chunk(
     *,
-    client: texttospeech.TextToSpeechClient,
+    client: GeminiTTSClient,
     text: str,
     language_code: str,
     voice_name: str,
-    model_name: Optional[str] = None,
+    model_name: str,
+    sample_rate_hertz: int,
     prompt: Optional[str] = None,
 ) -> bytes:
-    # SynthesisInput(prompt=...) + VoiceSelectionParams(model_name=...) are used in your notebook.
-    # Some environments may not support prompt/model_name yet; we fall back gracefully.
-    try:
-        synthesis_input = texttospeech.SynthesisInput(text=text, prompt=prompt) if prompt else texttospeech.SynthesisInput(text=text)
-    except TypeError:
-        synthesis_input = texttospeech.SynthesisInput(text=text)
+    payload = {
+        "input": {
+            "text": text,
+        },
+        "voice": {
+            "languageCode": language_code,
+            "name": voice_name,
+            "modelName": model_name,
+        },
+        "audioConfig": {
+            "audioEncoding": "LINEAR16",
+            "sampleRateHertz": sample_rate_hertz,
+        },
+    }
+    if prompt:
+        payload["input"]["prompt"] = prompt
 
-    try:
-        voice = texttospeech.VoiceSelectionParams(language_code=language_code, name=voice_name, model_name=model_name) if model_name else texttospeech.VoiceSelectionParams(language_code=language_code, name=voice_name)
-    except TypeError:
-        voice = texttospeech.VoiceSelectionParams(language_code=language_code, name=voice_name)
+    response = client.session.post(
+        API_URL,
+        headers={
+            "x-goog-user-project": client.project_id,
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=180,
+    )
 
-    audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
+    if not response.ok:
+        raise RuntimeError(
+            f"TTS request failed with HTTP {response.status_code}: {response.text}"
+        )
 
-    resp = client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
-    return resp.audio_content
+    response_json = response.json()
+    audio_content = response_json.get("audioContent")
+    if not audio_content:
+        raise RuntimeError(f"TTS response did not contain audioContent: {response_json}")
 
-def synthesize_mp3_with_retry(
+    return base64.b64decode(audio_content)
+
+
+def build_wav_bytes(pcm_audio: bytes, sample_rate_hertz: int) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate_hertz)
+        wav_file.writeframes(pcm_audio)
+    return buffer.getvalue()
+
+
+def synthesize_wav_with_retry(
     *,
-    client: texttospeech.TextToSpeechClient,
+    client: GeminiTTSClient,
     throttle: Throttle,
     text: str,
     language_code: str,
     voice_name: str,
-    model_name: Optional[str] = None,
+    model_name: str,
     prompt: Optional[str] = None,
+    sample_rate_hertz: int = DEFAULT_SAMPLE_RATE_HERTZ,
+    max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES,
     max_retries: int = 6,
     base_backoff: float = 4.0,
 ) -> bytes:
-    for attempt in range(1, max_retries + 1):
-        try:
-            throttle.wait()
-            return synthesize_mp3(
-                client=client,
-                text=text,
-                language_code=language_code,
-                voice_name=voice_name,
-                model_name=model_name,
-                prompt=prompt,
-            )
-        except Exception as e:
-            msg = str(e)
-            if "Prompt is only supported for Gemini TTS" in msg:
-                # Retry once without prompt for non-Gemini voices.
-                return synthesize_mp3(
-                    client=client,
-                    text=text,
-                    language_code=language_code,
-                    voice_name=voice_name,
-                    model_name=model_name,
-                    prompt=None,
+    chunks = split_text_into_chunks(text, max_bytes=max_chunk_bytes)
+    pcm_audio = bytearray()
+
+    for index, chunk in enumerate(chunks, start=1):
+        prompt_for_chunk = prompt if index == 1 else None
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                throttle.wait()
+                pcm_audio.extend(
+                    synthesize_chunk(
+                        client=client,
+                        text=chunk,
+                        language_code=language_code,
+                        voice_name=voice_name,
+                        model_name=model_name,
+                        sample_rate_hertz=sample_rate_hertz,
+                        prompt=prompt_for_chunk,
+                    )
                 )
-            if any(x in msg for x in ["502", "503", "RESOURCE_EXHAUSTED", "429"]) and attempt < max_retries:
-                sleep_s = (base_backoff * (2 ** (attempt - 1))) + random.uniform(0, 1.25)
-                time.sleep(sleep_s)
-                continue
-            raise
+                break
+            except Exception as exc:
+                msg = str(exc)
+                if "Prompt is only supported for Gemini TTS" in msg and prompt_for_chunk:
+                    pcm_audio.extend(
+                        synthesize_chunk(
+                            client=client,
+                            text=chunk,
+                            language_code=language_code,
+                            voice_name=voice_name,
+                            model_name=model_name,
+                            sample_rate_hertz=sample_rate_hertz,
+                            prompt=None,
+                        )
+                    )
+                    break
+                if any(code in msg for code in ["429", "502", "503", "504", "RESOURCE_EXHAUSTED"]) and attempt < max_retries:
+                    sleep_s = (base_backoff * (2 ** (attempt - 1))) + random.uniform(0, 1.25)
+                    time.sleep(sleep_s)
+                    continue
+                raise
+
+    return build_wav_bytes(bytes(pcm_audio), sample_rate_hertz=sample_rate_hertz)

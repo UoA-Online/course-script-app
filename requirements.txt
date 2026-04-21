@@ -3,7 +3,5 @@ requests
 pandas
 pydantic
 google-genai
-google-cloud-texttospeech
 google-auth
-google-api-core
 mutagen

@@ -1,44 +1,54 @@
-\
 import io
 import zipfile
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import pandas as pd
 import streamlit as st
-import google.auth
 
-from src.prompts import SYSTEM_INSTRUCTION_LONG, SYSTEM_METADATA
-from src.utils import dedupe_preserve_order
 from src.gemini_client import get_client as get_gemini_client
-from src.tts_client import get_tts_client
-from src.pipeline import (
-    run_script_generation,
-    run_tts_generation,
-    run_youtube_metadata,
+from src.pipeline import run_script_generation, run_tts_generation, run_youtube_metadata
+from src.prompts import SYSTEM_INSTRUCTION_LONG, SYSTEM_METADATA
+from src.tts_client import DEFAULT_MAX_CHUNK_BYTES, DEFAULT_SAMPLE_RATE_HERTZ, get_tts_client
+from src.utils import dedupe_preserve_order
+
+DEFAULT_TTS_STYLE_PROMPT = (
+    "Speak in a natural UK English accent. "
+    "Sound warm, conversational, and human like a university course narrator. "
+    "Use varied intonation, light emphasis, and natural pauses. "
+    "Avoid sounding like a robot or reading an advert."
 )
 
-from google.cloud import texttospeech
+
+def resolve_service_account_value(uploaded_file, text_value: str) -> str:
+    if uploaded_file is not None:
+        return uploaded_file.getvalue().decode("utf-8")
+    return (text_value or "").strip()
+
+
+def load_audio_blobs_from_zip(uploaded_zip) -> Dict[str, bytes]:
+    blobs_by_name: Dict[str, bytes] = {}
+    with zipfile.ZipFile(uploaded_zip) as zf:
+        for name in zf.namelist():
+            lower_name = name.lower()
+            if lower_name.endswith(".wav") or lower_name.endswith(".mp3"):
+                blobs_by_name[name.split("/")[-1]] = zf.read(name)
+    return blobs_by_name
+
 
 st.set_page_config(page_title="Course Script + Audio + YouTube Metadata", layout="wide")
-st.title("Course Script Generator (Gemini) + Audio (Google TTS) + YouTube Metadata")
+st.title("Course Script Generator (Gemini) + Audio (Gemini TTS) + YouTube Metadata")
 
-# ----------------------------
-# Session state
-# ----------------------------
 if "df_scripts" not in st.session_state:
     st.session_state["df_scripts"] = None
 if "df_audio" not in st.session_state:
     st.session_state["df_audio"] = None
 if "audio_blobs" not in st.session_state:
-    st.session_state["audio_blobs"] = []  # List[(filename, bytes)]
+    st.session_state["audio_blobs"] = []
 if "df_yt" not in st.session_state:
     st.session_state["df_yt"] = None
 if "failures" not in st.session_state:
     st.session_state["failures"] = None
 
-# ----------------------------
-# Sidebar: keys + model config
-# ----------------------------
 with st.sidebar:
     st.header("Credentials")
 
@@ -46,7 +56,7 @@ with st.sidebar:
         "Gemini API key (GEMINI_API_KEY)",
         type="password",
         value=st.secrets.get("GEMINI_API_KEY", ""),
-        help="Use Streamlit secrets in deployment; don’t hardcode keys.",
+        help="Use Streamlit secrets in deployment; do not hardcode keys.",
     )
 
     st.header("Gemini models")
@@ -55,79 +65,56 @@ with st.sidebar:
 
     st.header("Rate limits")
     min_seconds_scripts = st.slider("Seconds between script calls", 0.0, 10.0, 3.0, 0.5)
+    min_seconds_tts = st.slider("Seconds between TTS chunk calls", 0.0, 10.0, 0.5, 0.5)
     min_seconds_yt = st.slider("Seconds between metadata calls", 0.0, 10.0, 1.5, 0.5)
 
-    st.header("Google Cloud TTS (ADC)")
-    st.caption("TTS uses Application Default Credentials (ADC) or a service account JSON provided below.")
+    st.header("Gemini TTS")
+    st.caption("Audio generation now uses the demo service-account flow and exports WAV files.")
     language_code = st.text_input("Language code", value="en-GB")
-    with st.expander("TTS credentials (optional)", expanded=False):
-        st.caption(
-            "Provide either a service account JSON or an access token to avoid gcloud login.\n\n"
-            "How to get a service account JSON:\n"
-            "1) Google Cloud Console → IAM & Admin → Service Accounts\n"
-            "2) Create Service Account and grant Text-to-Speech User role\n"
-            "3) Open the service account → Keys → Add Key → Create new key → JSON\n"
-            "4) Paste the JSON contents here"
-        )
-        sa_json = st.text_area(
-            "Service account JSON",
+    voice_name = st.text_input("Voice name", value="Vindemiatrix")
+    model_name = st.text_input("TTS model", value="gemini-2.5-pro-tts")
+    style_prompt = st.text_area("Style prompt", value=DEFAULT_TTS_STYLE_PROMPT, height=140)
+
+    with st.expander("Service account", expanded=False):
+        uploaded_service_account = st.file_uploader("Upload service account JSON", type=["json"], key="tts_service_account_file")
+        service_account_text = st.text_area(
+            "Or paste service account JSON or a local file path",
             value=st.secrets.get("GCP_TTS_SERVICE_ACCOUNT_JSON", ""),
-            height=140,
+            height=160,
             placeholder='{"type":"service_account",...}',
         )
-        access_token = st.text_input(
-            "Access token",
-            value=st.secrets.get("GCP_TTS_ACCESS_TOKEN", ""),
-            type="password",
-            help="Short-lived OAuth access token. Will expire.",
+        if uploaded_service_account is not None:
+            st.caption(f"Using uploaded file: {uploaded_service_account.name}")
+
+    with st.expander("Advanced audio settings", expanded=False):
+        sample_rate_hertz = st.number_input(
+            "Sample rate (Hz)",
+            min_value=8000,
+            max_value=48000,
+            value=DEFAULT_SAMPLE_RATE_HERTZ,
+            step=1000,
+        )
+        max_chunk_bytes = st.number_input(
+            "Max bytes per TTS chunk",
+            min_value=200,
+            max_value=4000,
+            value=DEFAULT_MAX_CHUNK_BYTES,
+            step=100,
+            help="Keeps each request under the demo TTS chunk size limit.",
         )
 
-    # Voice list (cached)
-    @st.cache_data(show_spinner=False, ttl=3600)
-    def list_voices(language_code: str, sa_json: str, access_token: str) -> List[str]:
-        client = get_tts_client(
-            service_account_json=sa_json or None,
-            access_token=access_token or None,
-        )
-        voices = client.list_voices(language_code=language_code).voices
-        return sorted({v.name for v in voices})
+service_account_value = resolve_service_account_value(uploaded_service_account, service_account_text)
 
-    enable_tts = st.toggle("Generate MP3", value=False)
-
-    voice_name = ""
-    model_name = ""
-    style_prompt = ""
-
-    if enable_tts:
-        try:
-            voice_options = list_voices(language_code, sa_json, access_token)
-            voice_name = st.selectbox("Voice name", options=voice_options)
-        except Exception as e:
-            st.warning("Could not list voices. Check ADC / permissions.")
-            st.exception(e)
-
-        st.caption("Optional advanced fields (from your notebook)")
-        model_name = st.text_input("TTS model_name (optional)", value="")  # e.g. gemini-2.5-pro-tts
-        style_prompt = st.text_area("TTS prompt (optional)", value="", height=120)
-
-# ----------------------------
-# Tabs
-# ----------------------------
 tab1, tab2, tab3 = st.tabs(["1) Generate scripts", "2) Generate audio", "3) YouTube metadata"])
 
-# ----------------------------
-# Tab 1: Scripts
-# ----------------------------
 with tab1:
-    st.subheader("Generate 2–3 minute scripts from course URLs")
-
-    default_urls = ""
+    st.subheader("Generate 2-3 minute scripts from course URLs")
 
     left, right = st.columns([2, 1], gap="large")
     with left:
         urls_text = st.text_area(
             "One URL per line",
-            value=default_urls,
+            value="",
             height=220,
             placeholder="https://example.com/course-a\nhttps://example.com/course-b",
         )
@@ -137,30 +124,34 @@ with tab1:
 
     def parse_urls() -> List[str]:
         if use_csv and upload_csv is not None:
-            dfu = pd.read_csv(upload_csv)
-            col = next((c for c in dfu.columns if c.lower() in ("link", "url")), None)
-            if col is None:
+            df_uploaded = pd.read_csv(upload_csv)
+            column = next((col for col in df_uploaded.columns if col.lower() in ("link", "url")), None)
+            if column is None:
                 st.error("CSV must have a 'link' or 'url' column.")
                 return []
-            return dedupe_preserve_order([str(x) for x in dfu[col].dropna().tolist()])
+            return dedupe_preserve_order([str(item) for item in df_uploaded[column].dropna().tolist()])
         return dedupe_preserve_order(urls_text.splitlines())
 
     urls = parse_urls()
     st.write(f"URLs queued: **{len(urls)}**")
 
-    run = st.button("Generate scripts", type="primary", use_container_width=True, disabled=(not gemini_api_key or not urls))
+    run_scripts = st.button(
+        "Generate scripts",
+        type="primary",
+        use_container_width=True,
+        disabled=(not gemini_api_key or not urls),
+    )
 
-    if run:
+    if run_scripts:
         client = get_gemini_client(gemini_api_key)
-
         prog = st.progress(0.0)
         status = st.empty()
 
-        def progress(i: int, total: int, label: str):
+        def progress(i: int, total: int, label: str) -> None:
             status.write(f"[{i}/{total}] {label}")
             prog.progress(i / total)
 
-        df, failed_df = run_script_generation(
+        df_scripts, failed_df = run_script_generation(
             gemini_client=client,
             model=gemini_script_model,
             system_instruction=SYSTEM_INSTRUCTION_LONG,
@@ -169,29 +160,30 @@ with tab1:
             progress=progress,
         )
 
-        st.session_state["df_scripts"] = df
+        st.session_state["df_scripts"] = df_scripts
         st.session_state["failures"] = failed_df
-
-        st.success(f"Done. Success: {len(df)} • Failed: {len(failed_df)}")
+        st.success(f"Done. Success: {len(df_scripts)} • Failed: {len(failed_df)}")
 
     if st.session_state["df_scripts"] is not None:
-        df = st.session_state["df_scripts"]
-        st.dataframe(df, use_container_width=True, height=420)
+        df_scripts = st.session_state["df_scripts"]
+        st.dataframe(df_scripts, use_container_width=True, height=420)
 
-        csv_bytes = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-        st.download_button("Download scripts CSV", data=csv_bytes, file_name="course_scripts_2_3min.csv", mime="text/csv")
+        csv_bytes = df_scripts.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        st.download_button(
+            "Download scripts CSV",
+            data=csv_bytes,
+            file_name="course_scripts_2_3min.csv",
+            mime="text/csv",
+        )
 
     if st.session_state["failures"] is not None and len(st.session_state["failures"]) > 0:
         st.subheader("Failures")
         st.dataframe(st.session_state["failures"], use_container_width=True)
 
-# ----------------------------
-# Tab 2: Audio
-# ----------------------------
 with tab2:
-    st.subheader("Generate MP3 audio from scripts (Google Cloud Text-to-Speech)")
-
+    st.subheader("Generate WAV audio from scripts (Gemini TTS service-account flow)")
     st.write("Input can be the scripts you generated in Tab 1, or a CSV you upload here.")
+
     upload_scripts_csv = st.file_uploader("Upload scripts CSV (title, link, script_2_3min)", type=["csv"], key="audio_csv")
     use_tab1 = st.toggle("Use Tab 1 results", value=True)
 
@@ -201,39 +193,35 @@ with tab2:
     elif upload_scripts_csv is not None:
         df_in = pd.read_csv(upload_scripts_csv)
 
+    if not service_account_value:
+        st.warning("Add a service account JSON in the sidebar to enable audio generation.")
+
     if df_in is None:
         st.info("Provide scripts first (Tab 1) or upload a CSV.")
     else:
         st.dataframe(df_in.head(10), use_container_width=True)
 
         run_audio = st.button(
-            "Generate MP3 files",
+            "Generate WAV files",
             type="primary",
             use_container_width=True,
-            disabled=(not enable_tts or not voice_name),
+            disabled=(not service_account_value or not voice_name or not model_name),
         )
 
         if run_audio:
             try:
-                tts_client = get_tts_client(
-                    service_account_json=sa_json or None,
-                    access_token=access_token or None,
-                )
-                if not (sa_json or access_token):
-                    creds, proj = google.auth.default()
-                    st.caption(f"ADC project: {proj} • quota_project: {getattr(creds, 'quota_project_id', None)}")
-                else:
-                    st.caption("Using provided TTS credentials (no ADC).")
-            except Exception as e:
-                st.error("Could not initialize TTS client. Check ADC setup.")
-                st.exception(e)
+                tts_client = get_tts_client(service_account_json=service_account_value)
+                st.caption(f"Using service account project: {tts_client.project_id}")
+            except Exception as exc:
+                st.error("Could not initialize Gemini TTS. Check the service account JSON.")
+                st.exception(exc)
                 tts_client = None
 
             if tts_client:
                 prog = st.progress(0.0)
                 status = st.empty()
 
-                def progress(i: int, total: int, label: str):
+                def progress(i: int, total: int, label: str) -> None:
                     status.write(f"[{i}/{total}] {label}")
                     prog.progress(i / total)
 
@@ -242,15 +230,18 @@ with tab2:
                     df_scripts=df_in,
                     language_code=language_code,
                     voice_name=voice_name,
-                    model_name=model_name or None,
+                    model_name=model_name,
                     prompt=style_prompt or None,
+                    sample_rate_hertz=int(sample_rate_hertz),
+                    max_chunk_bytes=int(max_chunk_bytes),
+                    min_seconds_between_calls=min_seconds_tts,
                     progress=progress,
                 )
 
                 st.session_state["df_audio"] = df_audio
                 st.session_state["audio_blobs"] = blobs
-
-                st.success(f"Generated {len(blobs)} MP3 files.")
+                st.session_state["df_yt"] = None
+                st.success(f"Generated {len(blobs)} WAV files.")
 
         if st.session_state["df_audio"] is not None:
             df_audio = st.session_state["df_audio"]
@@ -258,34 +249,34 @@ with tab2:
             st.dataframe(df_audio, use_container_width=True, height=420)
 
             csv_bytes = df_audio.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-            st.download_button("Download audio CSV", data=csv_bytes, file_name="course_scripts_2_3min_with_audio.csv", mime="text/csv")
+            st.download_button(
+                "Download audio CSV",
+                data=csv_bytes,
+                file_name="course_scripts_2_3min_with_audio.csv",
+                mime="text/csv",
+            )
 
             if st.session_state["audio_blobs"]:
-                # Build ZIP: mp3/ + csv
                 zip_buf = io.BytesIO()
                 with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                     zf.writestr("course_scripts_2_3min_with_audio.csv", csv_bytes)
                     for fname, blob in st.session_state["audio_blobs"]:
-                        zf.writestr(f"mp3/{fname}", blob)
+                        zf.writestr(f"audio/{fname}", blob)
                 zip_buf.seek(0)
 
                 st.download_button(
-                    "Download ZIP (CSV + MP3s)",
+                    "Download ZIP (CSV + WAVs)",
                     data=zip_buf.getvalue(),
                     file_name="scripts_with_audio.zip",
                     mime="application/zip",
                     use_container_width=True,
                 )
 
-# ----------------------------
-# Tab 3: YouTube metadata
-# ----------------------------
 with tab3:
     st.subheader("Generate YouTube metadata (needs audio to compute duration phrase)")
+    st.write("Best flow: generate scripts -> generate audio -> generate YouTube metadata in one session.")
 
-    st.write("Best flow: generate scripts → generate audio → generate YouTube metadata in one session.")
     use_audio_tab = st.toggle("Use Tab 2 results", value=True)
-
     df_audio = None
     blobs_by_name: Dict[str, bytes] = {}
 
@@ -294,30 +285,26 @@ with tab3:
         blobs_by_name = {fname: blob for fname, blob in st.session_state["audio_blobs"]}
     else:
         upload_audio_csv = st.file_uploader("Upload audio CSV (must include audio_2_3min_file)", type=["csv"], key="yt_csv")
-        upload_zip = st.file_uploader("Upload ZIP of MP3s (mp3/<file>.mp3)", type=["zip"], key="yt_zip")
+        upload_zip = st.file_uploader("Upload ZIP of audio files", type=["zip"], key="yt_zip")
         if upload_audio_csv is not None:
             df_audio = pd.read_csv(upload_audio_csv)
         if upload_zip is not None:
-            with zipfile.ZipFile(upload_zip) as zf:
-                for n in zf.namelist():
-                    if n.lower().endswith(".mp3"):
-                        blobs_by_name[n.split("/")[-1]] = zf.read(n)
+            blobs_by_name = load_audio_blobs_from_zip(upload_zip)
 
     if df_audio is None:
-        st.info("Provide audio CSV + MP3s (Tab 2 or uploads).")
+        st.info("Provide audio CSV + audio files (Tab 2 or uploads).")
     else:
         st.dataframe(df_audio.head(10), use_container_width=True)
 
-        # Pre-flight checks to explain why rows may be skipped
         required_cols = ["title", "link", "script_2_3min", "audio_2_3min_file"]
-        missing_cols = [c for c in required_cols if c not in df_audio.columns]
-        st.caption(f"MP3s available in session/ZIP: {len(blobs_by_name)}")
+        missing_cols = [col for col in required_cols if col not in df_audio.columns]
+        st.caption(f"Audio files available in session/ZIP: {len(blobs_by_name)}")
         if missing_cols:
             st.warning(f"Missing required columns: {', '.join(missing_cols)}")
 
         total_rows = len(df_audio)
         missing_fields = 0
-        missing_mp3 = 0
+        missing_audio = 0
         already_filled = 0
         ready_rows = 0
 
@@ -332,18 +319,18 @@ with tab3:
                 missing_fields += 1
                 continue
             if audio_file not in blobs_by_name:
-                missing_mp3 += 1
+                missing_audio += 1
                 continue
             if yt_desc and yt_desc.lower() != "nan":
                 already_filled += 1
                 continue
             ready_rows += 1
 
-        if missing_fields or missing_mp3 or already_filled:
+        if missing_fields or missing_audio or already_filled:
             st.warning(
                 "Some rows will be skipped. "
                 f"Missing required fields: {missing_fields} • "
-                f"MP3 not found: {missing_mp3} • "
+                f"Audio file not found: {missing_audio} • "
                 f"Already has metadata: {already_filled} • "
                 f"Total rows: {total_rows}"
             )
@@ -358,11 +345,10 @@ with tab3:
 
         if run_yt:
             client = get_gemini_client(gemini_api_key)
-
             prog = st.progress(0.0)
             status = st.empty()
 
-            def progress(i: int, total: int, label: str):
+            def progress(i: int, total: int, label: str) -> None:
                 status.write(f"[{i}/{total}] {label}")
                 prog.progress(i / total)
 
@@ -377,7 +363,6 @@ with tab3:
             )
 
             st.session_state["df_yt"] = df_yt
-            # Post-run visibility: did anything get filled?
             filled = 0
             if df_yt is not None and "yt_description" in df_yt.columns:
                 filled = df_yt["yt_description"].fillna("").astype(str).str.strip().ne("").sum()
@@ -399,4 +384,9 @@ with tab3:
         st.dataframe(df_yt, use_container_width=True, height=420)
 
         csv_bytes = df_yt.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-        st.download_button("Download CSV with YouTube metadata", data=csv_bytes, file_name="course_scripts_with_audio_and_yt.csv", mime="text/csv")
+        st.download_button(
+            "Download CSV with YouTube metadata",
+            data=csv_bytes,
+            file_name="course_scripts_with_audio_and_yt.csv",
+            mime="text/csv",
+        )

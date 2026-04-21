@@ -1,10 +1,10 @@
 # Course Script + Audio + YouTube Metadata (Streamlit)
 
-This app converts your notebook into a multi-step Streamlit UI:
+This app converts course URLs into a 3-step workflow:
 
-1. Generate 2–3 minute spoken scripts from course URLs (Gemini).
-2. Generate MP3 voiceover for each script (Google Cloud Text-to-Speech).
-3. Generate YouTube title/description/tags using script + audio duration (Gemini).
+1. Generate 2-3 minute spoken scripts from course URLs with Gemini.
+2. Generate WAV voiceover for each script with Gemini TTS using a Google service account.
+3. Generate YouTube title/description/tags using the script plus computed audio duration.
 
 ## Setup
 
@@ -18,21 +18,21 @@ pip install -r requirements.txt
 ### Gemini
 Set `GEMINI_API_KEY` using Streamlit secrets or environment variables.
 
-`.streamlit/secrets.toml` (create this file; do not commit):
+`.streamlit/secrets.toml`:
 ```toml
 GEMINI_API_KEY = "YOUR_KEY"
-GCP_QUOTA_PROJECT = "optional-quota-project"
+GCP_TTS_SERVICE_ACCOUNT_JSON = """{"type":"service_account",...}"""
 ```
 
-### Google Cloud TTS (ADC)
-This app uses Application Default Credentials (ADC). Configure in your shell (local dev):
+### Gemini TTS service account
+The audio step now uses the same service-account flow as `demo tts/google_tts_service_account.py`.
 
-```bash
-gcloud auth application-default login
-gcloud auth application-default set-quota-project YOUR_QUOTA_PROJECT
-```
+You can provide the service account in the sidebar by:
+- Uploading the JSON file
+- Pasting the raw JSON
+- Entering a local file path
 
-Or for deployment, use a service account JSON and set `GOOGLE_APPLICATION_CREDENTIALS`.
+The service account needs permission to call Google Cloud Text-to-Speech.
 
 ## Run
 ```bash
@@ -40,5 +40,6 @@ streamlit run app.py
 ```
 
 ## Notes
-- Do **not** hardcode API keys in code.
-- The YouTube metadata step needs the MP3 bytes to compute duration; easiest is to run steps 1→2→3 in one session, or upload the CSV + ZIP of MP3s.
+- Audio exports are WAV files.
+- The YouTube metadata step needs the generated audio bytes to compute duration, so the easiest flow is still 1 -> 2 -> 3 in one session.
+- If you move between sessions, upload the audio CSV plus the ZIP from Tab 2.
