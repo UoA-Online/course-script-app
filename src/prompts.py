@@ -13,6 +13,7 @@ title:
 
 script_2_3min:
 - Length: aim for around 2–3 minutes of spoken audio (roughly 260–400 words).
+- British English spelling throughout (-ise, programme, recognise).
 - Second person (“you”), natural spoken voiceover, no bullets or headings.
 - Short, varied sentences that sound like a human voiceover (not brochure copy).
 - Summarise the page broadly in the same order it appears on the website.
